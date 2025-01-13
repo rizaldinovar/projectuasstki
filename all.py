@@ -1,23 +1,16 @@
-import streamlit as st # type: ignore
-import torch # type: ignore
-from torchvision.models import vit_b_16 # type: ignore
-from torchvision import transforms # type: ignore
-from PIL import Image # type: ignore
+import streamlit as st
+import torch
+from torchvision.models import vit_b_16
+from torchvision import transforms
+from PIL import Image
 from collections import OrderedDict
-import pandas as pd # type: ignore
-import numpy as np # type: ignore
-from sklearn.feature_extraction.text import TfidfVectorizer # type: ignore
-from sklearn.metrics.pairwise import cosine_similarity # type: ignore
-from sklearn.neighbors import NearestNeighbors # type: ignore
-from sklearn.preprocessing import LabelEncoder # type: ignore
-import nltk # type: ignore
-from nltk.tokenize import word_tokenize # type: ignore
-from nltk.corpus import stopwords # type: ignore
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
 import re
-
-# Download NLTK resources
-nltk.download('punkt')
-nltk.download('stopwords')
+from sentence_transformers import SentenceTransformer  # Menggunakan Sentence-BERT
 
 # Fungsi untuk memuat model dari checkpoint
 @st.cache_resource
@@ -25,7 +18,7 @@ def load_model():
     try:
         # Buat model ViT dengan arsitektur yang sama
         model = vit_b_16(weights=None)  # Jangan gunakan pretrained weights
-        model.heads = torch.nn.Sequential(OrderedDict([
+        model.heads = torch.nn.Sequential(OrderedDict([ 
             ('head', torch.nn.Linear(in_features=768, out_features=3))  # Sesuaikan jumlah kelas
         ]))
 
@@ -49,11 +42,24 @@ def preprocess_image(image):
     ])
     return transform(image).unsqueeze(0)
 
-# Load model
+# Fungsi untuk membersihkan teks
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z\s]', '', text)
+    return text
+
+# Memuat model Sentence-BERT
+@st.cache_resource
+def load_sentence_bert_model():
+    model = SentenceTransformer('all-MiniLM-L6-v2')  # Memuat model Sentence-BERT
+    return model
+
+# Memuat model dan Sentence-BERT
 model = load_model()
+sentence_bert_model = load_sentence_bert_model()
 
 # Hentikan aplikasi jika model gagal dimuat
-if model is None:
+if model is None or sentence_bert_model is None:
     st.stop()
 
 # Judul aplikasi
@@ -85,34 +91,17 @@ if uploaded_file is not None:
     except Exception as e:
         st.error(f"Error processing image: {e}")
 
-# Setelah prediksi, lanjut ke pencarian dan rekomendasi skincare
-
 # Membaca dataset yang sudah dibersihkan
 file_path = 'C:/Users/rizal/Videos/stkif/dataset_cleaned.csv'
 data = pd.read_csv(file_path)
 
-# Preprocessing: Menghapus nilai kosong dan karakter non-alfabet
-def clean_text(text):
-    text = text.lower()
-    text = re.sub(r'[^a-z\s]', '', text)
-    return text
-
-# Fungsi untuk membersihkan kolom harga
-def clean_price(price):
-    # Hapus duplikasi "Rp" dan karakter non-digit
-    clean_value = re.sub(r'[^0-9]', '', price)  # Ambil hanya angka
-    # Format dengan pemisah ribuan
-    formatted_price = f"Rp {int(clean_value):,}".replace(",", ".")
-    return formatted_price
-
 # Terapkan fungsi preprocessing pada dataset
 data['deskripsi_produk'] = data['deskripsi_produk'].apply(clean_text)
 data['masalah_kulit_yang_ditangani'] = data['masalah_kulit_yang_ditangani'].apply(clean_text)
-data['harga_produk'] = data['harga_produk'].apply(clean_price)  # Perbaikan harga
 
-# TF-IDF Vectorization untuk Deskripsi Produk (untuk IR)
-tfidf = TfidfVectorizer(stop_words='english')
-tfidf_matrix = tfidf.fit_transform(data['deskripsi_produk'])
+# Menambahkan kategori produk
+# Pastikan kolom kategori_produk ada di dataset Anda
+data['kategori_produk'] = data['kategori_produk'].apply(clean_text)
 
 # KNN untuk Content-Based Filtering
 label_encoder = LabelEncoder()
@@ -122,23 +111,45 @@ knn = NearestNeighbors(n_neighbors=5, metric='cosine')
 X = data[['jenis_kulit_yang_cocok_encoded']].values  # Fitur jenis kulit yang cocok
 knn.fit(X)
 
+# Fungsi untuk mencari kategori berdasarkan query
+def get_category_from_query(query, label_encoder):
+    try:
+        # Mencoba untuk mengubah query menjadi kategori encoded
+        query_category_encoded = label_encoder.transform([query.lower()])[0]
+    except ValueError:
+        # Jika label tidak ditemukan, pilih kategori default atau yang paling mendekati
+        st.warning("Kategori tidak ditemukan. Menampilkan rekomendasi skincare berdasarkan masalah kulit default.")
+        query_category_encoded = 0  # Misalnya memilih kategori pertama sebagai default
+    return query_category_encoded
+
+# Fungsi untuk mendapatkan vektor dari Sentence-BERT
+def get_sentence_bert_vector(text, model):
+    return model.encode(text)  # Mendapatkan vektor kalimat menggunakan Sentence-BERT
+
 # Query pencarian
 query = st.text_input("Masukkan masalah kulit Anda untuk mencari produk skincare:", skin_condition if uploaded_file else "")
 
 if st.button('Cari'):
     if query:
-        # Proses Query untuk IR (TF-IDF + Cosine Similarity)
-        query_tfidf = tfidf.transform([query.lower()])
-        cosine_similarities = cosine_similarity(query_tfidf, tfidf_matrix).flatten()
+        # Preprocessing query untuk mendapatkan vektor dari Sentence-BERT
+        query_vector = get_sentence_bert_vector(query.lower(), sentence_bert_model)
+
+        # Cosine Similarity antara query dan deskripsi produk
+        cosine_similarities = []
+        for i, desc in enumerate(data['deskripsi_produk']):
+            product_vector = get_sentence_bert_vector(desc, sentence_bert_model)
+            similarity = cosine_similarity([query_vector], [product_vector])[0][0]
+            cosine_similarities.append(similarity)
 
         # Menampilkan hasil berdasarkan IR
-        top_indices_ir = cosine_similarities.argsort()[-5:][::-1]
+        top_indices_ir = np.argsort(cosine_similarities)[-5:][::-1]
         st.subheader("Hasil Pencarian Skincare Berdasarkan Masalah Kulit Anda")
         for idx in top_indices_ir:
             st.write(f"Produk: {data['nama_produk'].iloc[idx]}")
             st.write(f"Brand: {data['nama_brand'].iloc[idx]}")
             st.write(f"Deskripsi: {data['deskripsi_produk'].iloc[idx]}")
             st.write(f"Masalah Kulit yang Ditangani: {data['masalah_kulit_yang_ditangani'].iloc[idx]}")
-            st.write(f"Harga: {data['harga_produk'].iloc[idx]}")  # Harga terformat
+            st.write(f"Kategori Produk: {data['kategori_produk'].iloc[idx]}")
+            st.write(f"Harga: {data['harga_produk'].iloc[idx]}")
             st.write(f"Link Pembelian: {data['link_pembelian'].iloc[idx]}")
             st.write("---")
